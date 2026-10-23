@@ -1,0 +1,10 @@
+#include <windows.h>
+
+1 RT_MANIFEST "app.manifest"
+1 ICON "phonecam.ico"
+
+// Embedded so the exe runs on its own (see install.cpp); found via rc /i.
+101 RCDATA "PhoneCamVCam.dll"
+102 RCDATA "adb.exe"
+103 RCDATA "AdbWinApi.dll"
+104 RCDATA "AdbWinUsbApi.dll"

@@ -1,0 +1,10 @@
+# build output (release files are attached to GitHub releases instead)
+dist/
+windows/obj/
+windows/dist/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.h264
