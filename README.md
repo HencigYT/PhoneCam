@@ -13,6 +13,25 @@ Zoom, browsers). / Android telefon kamerája alacsony késésű webkameraként W
 |---|---|
 | `PhoneCam.exe` | Windows 11 PC – önálló, nem kell mellé semmi / standalone, nothing else needed |
 | `PhoneCam.apk` | Android telefon/tablet (Android 11+) / Android phone or tablet |
+| `PhoneCam-linux.jar` | Linux PC – lásd lent / see [Linux](#linux) |
+
+## Linux
+
+```sh
+# Debian/Ubuntu (Fedora: sudo dnf install java-21-openjdk ffmpeg v4l2loopback,
+# Arch: sudo pacman -S jre-openjdk ffmpeg v4l2loopback-dkms)
+sudo apt install default-jre ffmpeg v4l2loopback-dkms
+java -jar PhoneCam-linux.jar --setup   # egyszer / once: creates the "PhoneCam" camera (/dev/video42)
+java -jar PhoneCam-linux.jar
+```
+
+HU: A Linuxos program ugyanúgy működik, mint a Windowsos (felület, nyelv, a telefon vezérlése),
+a kép a „PhoneCam” v4l2loopback kamerán jelenik meg, amit egyszerre több program is használhat.
+A kamera csak akkor látszik az appokban, amíg a PhoneCam fut.
+
+EN: The Linux app works like the Windows one (UI, language, phone control); the video appears on
+the "PhoneCam" v4l2loopback camera, which several programs can use at once. The camera is only
+visible to apps while PhoneCam is running.
 
 ---
 
@@ -96,6 +115,7 @@ stabilization, flash and zoom. Mirror and 180° rotation.
   Android platform-tools for the embedded adb). Self test without a phone:
   `windows\tools\build_selftest.cmd`, then `windows\obj\tools\selftest.exe`.
 - Android: `android\gradlew.bat assembleRelease` (JDK 17+, Android SDK 35).
+- Linux: `linux/build.sh` (JDK 17+) → `linux/dist/PhoneCam-linux.jar`.
 
 ```
 phone: Camera2 ──surface──> MediaCodec (HW H.264/H.265) ──TCP 47801──┐

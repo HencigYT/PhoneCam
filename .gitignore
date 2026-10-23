@@ -6,5 +6,7 @@ android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
+linux/out/
+linux/dist/
 *.apk
 *.h264

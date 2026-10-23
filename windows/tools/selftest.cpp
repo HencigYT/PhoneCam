@@ -258,6 +258,20 @@ int wmain(int argc, wchar_t** argv)
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION);
 
+    // "selftest phone W H FPS": only the fake phone, for testing another receiver (e.g. the Linux jar).
+    if (argc >= 5 && wcscmp(argv[1], L"phone") == 0)
+    {
+        W = _wtoi(argv[2]);
+        H = _wtoi(argv[3]);
+        FPS = _wtoi(argv[4]);
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+        std::vector<EncodedFrame> clip = EncodeClip();
+        printf("encoded %zu frames\n", clip.size());
+        FakePhone(&clip);
+        return 0;
+    }
+
     int64_t t0 = NowUs();
     std::vector<EncodedFrame> clip = EncodeClip();
     size_t bytes = 0;
