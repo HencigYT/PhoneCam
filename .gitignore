@@ -10,3 +10,4 @@ linux/out/
 linux/dist/
 *.apk
 *.h264
+__pycache__/
