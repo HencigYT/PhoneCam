@@ -9,32 +9,21 @@ ShmWriter::~ShmWriter()
         UnmapViewOfFile(_view);
     if (_map)
         CloseHandle(_map);
-    for (HANDLE e : _events)
-        if (e)
-            CloseHandle(e);
+    if (_event)
+        CloseHandle(_event);
 }
 
 // A non-elevated process may not create Global objects, so until the frame
 // server has created them (first time an app opens the camera) this keeps retrying.
 bool ShmWriter::EnsureOpen()
 {
-    ULONGLONG now = GetTickCount64();
     if (_view)
-    {
-        // A camera's event appears once an app opened that camera.
-        if (now - _lastEventTry > 1000)
-        {
-            _lastEventTry = now;
-            for (int i = 0; i < kCameraCount; i++)
-                if (!_events[i])
-                    _events[i] = OpenOrCreateEvent(i);
-        }
         return true;
-    }
+    ULONGLONG now = GetTickCount64();
     if (_lastOpenTry && now - _lastOpenTry < 250)
         return false;
     _lastOpenTry = now;
-    _map = OpenOrCreateMapping();
+    _map = OpenOrCreateMapping(_camera);
     if (!_map)
         return false;
     _view = MapViewOfFile(_map, FILE_MAP_ALL_ACCESS, 0, 0, kTotalBytes);
@@ -45,17 +34,15 @@ bool ShmWriter::EnsureOpen()
         return false;
     }
     InitHeader(Hdr());
-    for (int i = 0; i < kCameraCount; i++)
-        _events[i] = OpenOrCreateEvent(i);
-    _lastEventTry = now;
+    _event = OpenOrCreateEvent(_camera); // the DLL created both when an app opened the camera
     return true;
 }
 
-bool ShmWriter::ClientActive(int camera, int& width, int& height)
+bool ShmWriter::ClientActive(int& width, int& height)
 {
     if (!EnsureOpen())
         return false;
-    const ReaderInfo& r = Hdr()->readers[camera];
+    const ReaderInfo& r = Hdr()->reader;
     width = r.width;
     height = r.height;
     return GetTickCount64() - (ULONGLONG)r.tick < 1500;
@@ -147,7 +134,6 @@ void ShmWriter::Publish(const uint8_t* y, int yPitch, const uint8_t* uv, int uvP
     hd->fps = fps;
     InterlockedExchange64(&hd->writerTick, (LONG64)GetTickCount64());
     InterlockedIncrement64(&hd->frameCount);
-    for (HANDLE e : _events)
-        if (e)
-            SetEvent(e);
+    if (_event)
+        SetEvent(_event);
 }

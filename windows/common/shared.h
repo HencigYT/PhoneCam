@@ -8,22 +8,27 @@
 
 namespace pcam {
 
-// Windows lets only one app control a camera at a time, so the same picture is
-// offered as several cameras: e.g. Discord uses "PhoneCam", OBS "PhoneCam 2".
-constexpr int kCameraCount = 3;
+// Windows lets only one app control a camera at a time, and every camera can
+// show a different phone, so up to kMaxCameras cameras can be installed
+// ("PhoneCam", "PhoneCam 2", ...). How many are installed is a setup choice.
+constexpr int kMaxCameras = 8;
+constexpr int kDefaultCameras = 3;
 
-// {7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B17} .. 19
-static const GUID kCameraClsids[kCameraCount] = {
-    { 0x7b1e3c52, 0x9a4d, 0x4f6b, { 0x8e, 0x21, 0x5c, 0x3d, 0x9f, 0x0a, 0x6b, 0x17 } },
-    { 0x7b1e3c52, 0x9a4d, 0x4f6b, { 0x8e, 0x21, 0x5c, 0x3d, 0x9f, 0x0a, 0x6b, 0x18 } },
-    { 0x7b1e3c52, 0x9a4d, 0x4f6b, { 0x8e, 0x21, 0x5c, 0x3d, 0x9f, 0x0a, 0x6b, 0x19 } },
+// {7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B17} .. 1E
+#define PHONECAM_CLSID(last) { 0x7b1e3c52, 0x9a4d, 0x4f6b, { 0x8e, 0x21, 0x5c, 0x3d, 0x9f, 0x0a, 0x6b, last } }
+static const GUID kCameraClsids[kMaxCameras] = {
+    PHONECAM_CLSID(0x17), PHONECAM_CLSID(0x18), PHONECAM_CLSID(0x19), PHONECAM_CLSID(0x1A),
+    PHONECAM_CLSID(0x1B), PHONECAM_CLSID(0x1C), PHONECAM_CLSID(0x1D), PHONECAM_CLSID(0x1E),
 };
-static const wchar_t* const kCameraClsidStrings[kCameraCount] = {
-    L"{7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B17}",
-    L"{7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B18}",
-    L"{7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B19}",
+static const wchar_t* const kCameraClsidStrings[kMaxCameras] = {
+    L"{7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B17}", L"{7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B18}",
+    L"{7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B19}", L"{7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B1A}",
+    L"{7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B1B}", L"{7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B1C}",
+    L"{7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B1D}", L"{7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B1E}",
 };
-static const wchar_t* const kCameraNames[kCameraCount] = { L"PhoneCam", L"PhoneCam 2", L"PhoneCam 3" };
+static const wchar_t* const kCameraNames[kMaxCameras] = {
+    L"PhoneCam", L"PhoneCam 2", L"PhoneCam 3", L"PhoneCam 4", L"PhoneCam 5", L"PhoneCam 6", L"PhoneCam 7", L"PhoneCam 8",
+};
 
 // The frame server runs in session 0 as LOCAL SERVICE, so the objects have to
 // live in the Global namespace. Whichever side is allowed to create them does.
@@ -33,19 +38,19 @@ inline bool UseLocalNames()
     return GetEnvironmentVariableW(L"PHONECAM_TEST_LOCAL", nullptr, 0) > 0;
 }
 
-inline const wchar_t* ShmName()
+// Every camera has its own frame buffer and event, since each can show another phone.
+inline void ShmName(int camera, wchar_t* out, size_t size)
 {
-    return UseLocalNames() ? L"Local\\PhoneCam_Frames_v2" : L"Global\\PhoneCam_Frames_v2";
+    swprintf_s(out, size, L"%s\\PhoneCam_Frames_v3_%d", UseLocalNames() ? L"Local" : L"Global", camera);
 }
 
-// One auto-reset event per camera, so every camera wakes up on each new frame.
 inline void EventName(int camera, wchar_t* out, size_t size)
 {
-    swprintf_s(out, size, L"%s\\PhoneCam_NewFrame_v2_%d", UseLocalNames() ? L"Local" : L"Global", camera);
+    swprintf_s(out, size, L"%s\\PhoneCam_NewFrame_v3_%d", UseLocalNames() ? L"Local" : L"Global", camera);
 }
 
 constexpr uint32_t kMagic = 0x4D414350; // "PCAM"
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 constexpr uint32_t kMaxWidth = 3840;
 constexpr uint32_t kMaxHeight = 2160;
 constexpr uint32_t kSlotCount = 3;
@@ -78,7 +83,7 @@ struct Header
     volatile LONG64 appTick;     // PhoneCam.exe heartbeat, also without a phone
     volatile LONG phoneConnected;
     SlotInfo slots[kSlotCount];
-    ReaderInfo readers[kCameraCount];
+    ReaderInfo reader; // the camera client reading this buffer
     volatile LONG english; // UI language of PhoneCam.exe, for the camera placeholder text
 };
 static_assert(sizeof(Header) <= kHeaderBytes, "header does not fit");
@@ -102,16 +107,18 @@ inline bool MakeOpenSecurity(SECURITY_ATTRIBUTES& sa, PSECURITY_DESCRIPTOR& sd)
     return true;
 }
 
-inline HANDLE OpenOrCreateMapping()
+inline HANDLE OpenOrCreateMapping(int camera)
 {
-    HANDLE h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, ShmName());
+    wchar_t name[64];
+    ShmName(camera, name, 64);
+    HANDLE h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
     if (h)
         return h;
     SECURITY_ATTRIBUTES sa{};
     PSECURITY_DESCRIPTOR sd = nullptr;
     bool haveSd = MakeOpenSecurity(sa, sd);
     h = CreateFileMappingW(INVALID_HANDLE_VALUE, haveSd ? &sa : nullptr, PAGE_READWRITE,
-                           (DWORD)((uint64_t)kTotalBytes >> 32), (DWORD)kTotalBytes, ShmName());
+                           (DWORD)((uint64_t)kTotalBytes >> 32), (DWORD)kTotalBytes, name);
     if (sd)
         LocalFree(sd);
     return h;

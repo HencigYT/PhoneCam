@@ -7,7 +7,31 @@
 #include <algorithm>
 #include <deque>
 
-static std::mutex g_writerLock;
+// One connected phone. Stats and phone are guarded by Server::_lock; the clock
+// and counters belong to the session's own thread.
+struct Server::Session
+{
+    SOCKET socket = INVALID_SOCKET;
+    std::wstring name;     // unique among connected phones
+    std::wstring baseName; // as the phone reports it
+    std::wstring address;  // IP, or "USB"
+    std::mutex sendLock;
+    Stats stats;
+    PhoneInfo phone;
+    std::atomic<int> rotation{ 0 }, fps{ 0 };
+    std::atomic<bool> replaced{ false }, done{ false };
+    std::thread thread;
+
+    int64_t clockOffset = 0; // phone clock - PC clock (us)
+    bool clockValid = false;
+    int64_t bestRtt = 0, bestRttAt = 0;
+    double latencyAvg = -1;
+    int frames = 0;
+    int64_t bytes = 0;
+    double decodeAccum = 0;
+    int decodeCount = 0;
+    int64_t lastPreviewUs = 0;
+};
 
 int64_t NowUs()
 {
@@ -71,85 +95,6 @@ static bool RecvAll(SOCKET s, void* buffer, size_t size)
     return true;
 }
 
-bool Server::Start(std::wstring& error)
-{
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-    _codecs = Decoder::SupportedCodecs();
-
-    _listen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    BOOL exclusive = TRUE;
-    setsockopt(_listen, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&exclusive, sizeof(exclusive));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(pcam::UseLocalNames() ? proto::kTestStreamPort : proto::kStreamPort);
-    addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(_listen, (sockaddr*)&addr, sizeof(addr)) != 0 || listen(_listen, 4) != 0)
-    {
-        error = lang::g_english
-                    ? L"TCP port " + std::to_wstring(proto::kStreamPort) + L" is in use (is PhoneCam already running?)"
-                    : L"A " + std::to_wstring(proto::kStreamPort) + L" TCP port foglalt (fut már egy PhoneCam?)";
-        closesocket(_listen);
-        _listen = INVALID_SOCKET;
-        return false;
-    }
-    _running = true;
-    _acceptThread = std::thread(&Server::AcceptLoop, this);
-    // The self test must not attract real phones on the network.
-    if (!pcam::UseLocalNames())
-    {
-        _beaconThread = std::thread(&Server::BeaconLoop, this);
-        _adbThread = std::thread(&Server::AdbLoop, this);
-    }
-    return true;
-}
-
-void Server::Stop()
-{
-    if (!_running.exchange(false))
-        return;
-    closesocket(_listen);
-    SOCKET c = _client.exchange(INVALID_SOCKET);
-    if (c != INVALID_SOCKET)
-        shutdown(c, SD_BOTH);
-    for (std::thread* t : { &_acceptThread, &_clientThread, &_beaconThread, &_adbThread })
-        if (t->joinable())
-            t->join();
-}
-
-Stats Server::GetStats()
-{
-    std::lock_guard<std::mutex> lk(_statsLock);
-    return _stats;
-}
-
-std::vector<std::wstring> Server::LocalAddresses()
-{
-    std::lock_guard<std::mutex> lk(_statsLock);
-    return _addresses;
-}
-
-bool Server::ClientActive(int camera, int& width, int& height)
-{
-    std::lock_guard<std::mutex> lk(g_writerLock);
-    return _writer.ClientActive(camera, width, height);
-}
-
-PhoneInfo Server::GetPhoneInfo(uint64_t& serial)
-{
-    std::lock_guard<std::mutex> lk(_statsLock);
-    serial = _phoneSerial;
-    return _phone;
-}
-
-bool Server::SendSettings(const std::string& settings)
-{
-    SOCKET s = _client;
-    if (s == INVALID_SOCKET || !GetStats().connected)
-        return false;
-    return Send(s, proto::kSet, settings.data(), (uint32_t)settings.size());
-}
-
 static std::vector<std::string> Split(const std::string& s, char sep)
 {
     std::vector<std::string> out;
@@ -165,7 +110,7 @@ static std::vector<std::string> Split(const std::string& s, char sep)
 }
 
 // "key=value" lines; camera entries: cam=<id>|<label>|<WxH,...>|<fps,...>
-void Server::ParseInfo(const uint8_t* data, size_t size)
+static PhoneInfo ParseInfo(const uint8_t* data, size_t size)
 {
     PhoneInfo info;
     info.valid = true;
@@ -224,9 +169,149 @@ void Server::ParseInfo(const uint8_t* data, size_t size)
             info.cameras.push_back(cam);
         }
     }
-    std::lock_guard<std::mutex> lk(_statsLock);
-    _phone = info;
-    _phoneSerial++;
+    return info;
+}
+
+Server::Server()
+{
+    for (int i = 0; i < pcam::kMaxCameras; i++)
+        _writers[i].SetCamera(i);
+}
+
+bool Server::Start(std::wstring& error)
+{
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    _codecs = Decoder::SupportedCodecs();
+
+    _listen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    BOOL exclusive = TRUE;
+    setsockopt(_listen, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&exclusive, sizeof(exclusive));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(pcam::UseLocalNames() ? proto::kTestStreamPort : proto::kStreamPort);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(_listen, (sockaddr*)&addr, sizeof(addr)) != 0 || listen(_listen, 8) != 0)
+    {
+        error = lang::g_english
+                    ? L"TCP port " + std::to_wstring(proto::kStreamPort) + L" is in use (is PhoneCam already running?)"
+                    : L"A " + std::to_wstring(proto::kStreamPort) + L" TCP port foglalt (fut már egy PhoneCam?)";
+        closesocket(_listen);
+        _listen = INVALID_SOCKET;
+        return false;
+    }
+    _running = true;
+    _acceptThread = std::thread(&Server::AcceptLoop, this);
+    // The self test must not attract real phones on the network.
+    if (!pcam::UseLocalNames())
+    {
+        _beaconThread = std::thread(&Server::BeaconLoop, this);
+        _adbThread = std::thread(&Server::AdbLoop, this);
+    }
+    return true;
+}
+
+void Server::Stop()
+{
+    if (!_running.exchange(false))
+        return;
+    closesocket(_listen);
+    for (std::thread* t : { &_acceptThread, &_beaconThread, &_adbThread })
+        if (t->joinable())
+            t->join();
+    for (auto& c : _clients)
+    {
+        shutdown(c->socket, SD_BOTH);
+        if (c->thread.joinable())
+            c->thread.join();
+    }
+    _clients.clear();
+}
+
+std::vector<std::wstring> Server::Phones()
+{
+    std::lock_guard<std::mutex> lk(_lock);
+    std::vector<std::wstring> names;
+    for (auto& s : _sessions)
+        if (!s->replaced)
+            names.push_back(s->name);
+    return names;
+}
+
+uint64_t Server::PhonesSerial()
+{
+    std::lock_guard<std::mutex> lk(_lock);
+    return _serial;
+}
+
+Stats Server::GetStats(const std::wstring& phone)
+{
+    std::lock_guard<std::mutex> lk(_lock);
+    for (auto& s : _sessions)
+        if (!s->replaced && s->name == phone)
+            return s->stats;
+    return Stats{};
+}
+
+PhoneInfo Server::GetPhoneInfo(const std::wstring& phone)
+{
+    std::lock_guard<std::mutex> lk(_lock);
+    for (auto& s : _sessions)
+        if (!s->replaced && s->name == phone)
+            return s->phone;
+    return PhoneInfo{};
+}
+
+bool Server::SendSettings(const std::wstring& phone, const std::string& settings)
+{
+    std::shared_ptr<Session> target;
+    {
+        std::lock_guard<std::mutex> lk(_lock);
+        for (auto& s : _sessions)
+            if (!s->replaced && s->name == phone)
+                target = s;
+    }
+    return target && Send(*target, proto::kSet, settings.data(), (uint32_t)settings.size());
+}
+
+void Server::SetCameraPhone(int camera, const std::wstring& phone)
+{
+    std::lock_guard<std::mutex> lk(_lock);
+    _cameraPhone[camera] = phone;
+}
+
+std::shared_ptr<Server::Session> Server::Resolve(int camera)
+{
+    const std::wstring& want = _cameraPhone[camera];
+    for (auto& s : _sessions)
+        if (!s->replaced && (want.empty() || s->name == want))
+            return s;
+    return nullptr;
+}
+
+std::wstring Server::CameraSource(int camera)
+{
+    std::lock_guard<std::mutex> lk(_lock);
+    auto s = Resolve(camera);
+    return s ? s->name : L"";
+}
+
+void Server::SetPreviewPhone(const std::wstring& phone)
+{
+    std::lock_guard<std::mutex> lk(_lock);
+    _previewPhone = phone;
+}
+
+std::vector<std::wstring> Server::LocalAddresses()
+{
+    std::lock_guard<std::mutex> lk(_lock);
+    return _addresses;
+}
+
+bool Server::ClientActive(int camera, int& width, int& height)
+{
+    std::lock_guard<std::mutex> lk(_writerLocks[camera]);
+    return _writers[camera].ClientActive(width, height);
 }
 
 bool Server::GetPreview(std::vector<uint32_t>& pixels, int& width, int& height, uint64_t& serial)
@@ -255,35 +340,39 @@ void Server::AcceptLoop()
             Sleep(50);
             continue;
         }
-        // The newest connection wins (e.g. the phone reconnected after a Wi-Fi hiccup).
-        SOCKET old = _client.exchange(INVALID_SOCKET);
-        if (old != INVALID_SOCKET)
-            shutdown(old, SD_BOTH);
-        if (_clientThread.joinable())
-            _clientThread.join();
-        if (!_running)
+        // Reap finished connections.
+        for (auto it = _clients.begin(); it != _clients.end();)
         {
-            closesocket(s);
-            break;
+            if ((*it)->done)
+            {
+                (*it)->thread.join();
+                it = _clients.erase(it);
+            }
+            else
+                ++it;
         }
         wchar_t ip[64] = L"?";
         InetNtopW(AF_INET, &addr.sin_addr, ip, 64);
-        _client = s;
-        _clientThread = std::thread(&Server::ClientLoop, this, s, std::wstring(ip));
+        auto session = std::make_shared<Session>();
+        session->socket = s;
+        session->thread = std::thread(&Server::ClientLoop, this, session, std::wstring(ip));
+        _clients.push_back(session);
     }
 }
 
-bool Server::Send(SOCKET s, uint8_t type, const void* payload, uint32_t size)
+bool Server::Send(Session& s, uint8_t type, const void* payload, uint32_t size)
 {
     uint8_t header[5] = { type, (uint8_t)(size >> 24), (uint8_t)(size >> 16), (uint8_t)(size >> 8), (uint8_t)size };
-    std::lock_guard<std::mutex> lk(_sendLock);
-    if (send(s, (const char*)header, 5, 0) != 5)
+    std::lock_guard<std::mutex> lk(s.sendLock);
+    if (send(s.socket, (const char*)header, 5, 0) != 5)
         return false;
-    return size == 0 || send(s, (const char*)payload, (int)size, 0) == (int)size;
+    return size == 0 || send(s.socket, (const char*)payload, (int)size, 0) == (int)size;
 }
 
-void Server::ClientLoop(SOCKET s, std::wstring address)
+void Server::ClientLoop(std::shared_ptr<Session> session, std::wstring address)
 {
+    Session& self = *session;
+    SOCKET s = self.socket;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     BOOL noDelay = TRUE;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
@@ -310,27 +399,49 @@ void Server::ClientLoop(SOCKET s, std::wstring address)
     {
         std::string caps(1, (char)_codecs);
         caps += ToUtf8(ComputerName());
-        ok = Send(s, proto::kCaps, caps.data(), (uint32_t)caps.size());
+        ok = Send(self, proto::kCaps, caps.data(), (uint32_t)caps.size());
     }
     if (!ok)
     {
-        SOCKET expected = s;
-        _client.compare_exchange_strong(expected, INVALID_SOCKET);
         closesocket(s);
+        self.done = true;
         CoUninitialize();
         return;
     }
+    if (phoneName.empty())
+        phoneName = L"Phone";
 
     {
-        std::lock_guard<std::mutex> lk(_statsLock);
-        _stats = Stats{};
-        _stats.connected = true;
-        _stats.usb = usb;
-        _stats.phoneName = phoneName;
-        _stats.phoneAddress = usb ? L"USB" : address;
+        std::lock_guard<std::mutex> lk(_lock);
+        self.baseName = phoneName;
+        self.address = usb ? L"USB" : address;
+        // The same phone reconnecting (e.g. after a Wi-Fi hiccup) replaces its old connection.
+        for (auto& o : _sessions)
+        {
+            if (!o->replaced && o->baseName == self.baseName && o->address == self.address)
+            {
+                o->replaced = true;
+                shutdown(o->socket, SD_BOTH);
+            }
+        }
+        std::wstring unique = phoneName;
+        for (int n = 2;; n++)
+        {
+            bool taken = false;
+            for (auto& o : _sessions)
+                taken |= !o->replaced && o->name == unique;
+            if (!taken)
+                break;
+            unique = phoneName + L" (" + std::to_wstring(n) + L")";
+        }
+        self.name = unique;
+        self.stats.connected = true;
+        self.stats.usb = usb;
+        self.stats.phoneName = unique;
+        self.stats.phoneAddress = self.address;
+        _sessions.push_back(session);
+        _serial++;
     }
-    _clockValid = false;
-    _latencyAvg = -1;
 
     std::atomic<bool> alive{ true };
     std::thread pinger([&] {
@@ -338,7 +449,7 @@ void Server::ClientLoop(SOCKET s, std::wstring address)
         {
             uint8_t p[8];
             PutBe64(p, NowUs());
-            if (!Send(s, proto::kPing, p, 8))
+            if (!Send(self, proto::kPing, p, 8))
                 break;
             for (int i = 0; i < 10 && alive; i++)
                 Sleep(100);
@@ -356,11 +467,13 @@ void Server::ClientLoop(SOCKET s, std::wstring address)
         if (now - lastKeyRequest > 300000)
         {
             lastKeyRequest = now;
-            Send(s, proto::kRequestKey, nullptr, 0);
+            Send(self, proto::kRequestKey, nullptr, 0);
         }
     };
-    FrameCallback onFrame = [this](const uint8_t* y, int yp, const uint8_t* uv, int uvp, int w, int h, int64_t pts,
-                                   bool fullRange) { OnFrame(y, yp, uv, uvp, w, h, pts, fullRange); };
+    FrameCallback onFrame = [this, &self](const uint8_t* y, int yp, const uint8_t* uv, int uvp, int w, int h,
+                                          int64_t pts, bool fullRange) {
+        OnFrame(self, y, yp, uv, uvp, w, h, pts, fullRange);
+    };
 
     for (;;)
     {
@@ -385,20 +498,20 @@ void Server::ClientLoop(SOCKET s, std::wstring address)
             int bitrate = (int)Be32(p + 13), rotation = Be16(p + 17);
             std::wstring error;
             bool ready = decoder.Init(codec, w, h, fps, error);
-            _rotation = rotation;
-            _fps = fps;
+            self.rotation = rotation;
+            self.fps = fps;
             needKey = true;
             lastKeyRequest = 0;
             requestKey();
-            std::lock_guard<std::mutex> lk(_statsLock);
-            _stats.codec = codec;
-            _stats.width = w;
-            _stats.height = h;
-            _stats.fps = fps;
-            _stats.bitrate = bitrate;
-            _stats.rotation = rotation;
-            _stats.hardwareDecode = ready && decoder.IsHardware();
-            _stats.error = ready ? L"" : error;
+            std::lock_guard<std::mutex> lk(_lock);
+            self.stats.codec = codec;
+            self.stats.width = w;
+            self.stats.height = h;
+            self.stats.fps = fps;
+            self.stats.bitrate = bitrate;
+            self.stats.rotation = rotation;
+            self.stats.hardwareDecode = ready && decoder.IsHardware();
+            self.stats.error = ready ? L"" : error;
             break;
         }
         case proto::kFrame:
@@ -407,8 +520,8 @@ void Server::ClientLoop(SOCKET s, std::wstring address)
                 break;
             bool key = (p[0] & 1) != 0;
             int64_t pts = Be64(p + 1);
-            _frameCounter++;
-            _byteCounter += len;
+            self.frames++;
+            self.bytes += len;
             if (needKey && !key)
             {
                 requestKey();
@@ -419,20 +532,21 @@ void Server::ClientLoop(SOCKET s, std::wstring address)
             if (!decoder.Decode(p + 9, len - 9, pts, key, onFrame))
             {
                 // Corrupt stream or decoder hiccup: start over from the next key frame.
-                std::lock_guard<std::mutex> lk(_statsLock);
-                _stats.decodeErrors++;
+                std::lock_guard<std::mutex> lk(_lock);
+                self.stats.decodeErrors++;
                 wchar_t msg[64];
-                swprintf_s(msg, lang::tr(L"utolsó dekódolási hiba: 0x%08X", L"last decoding error: 0x%08X"), (unsigned)decoder.LastError());
-                _stats.error = msg;
+                swprintf_s(msg, lang::tr(L"utolsó dekódolási hiba: 0x%08X", L"last decoding error: 0x%08X"),
+                           (unsigned)decoder.LastError());
+                self.stats.error = msg;
                 std::wstring error;
-                decoder.Init(_stats.codec, _stats.width, _stats.height, _stats.fps, error);
+                decoder.Init(self.stats.codec, self.stats.width, self.stats.height, self.stats.fps, error);
                 needKey = true;
                 lastKeyRequest = 0;
                 requestKey();
                 break;
             }
-            _decodeAccum += (NowUs() - t0) / 1000.0;
-            _decodeCount++;
+            self.decodeAccum += (NowUs() - t0) / 1000.0;
+            self.decodeCount++;
             break;
         }
         case proto::kPong:
@@ -448,45 +562,50 @@ void Server::ClientLoop(SOCKET s, std::wstring address)
             std::vector<double> sorted(rtts.begin(), rtts.end());
             std::sort(sorted.begin(), sorted.end());
             // Trust the clock offset from the fastest round trips.
-            if (!_clockValid || rtt <= _bestRtt + 1500 || now - _bestRttAt > 10000000)
+            if (!self.clockValid || rtt <= self.bestRtt + 1500 || now - self.bestRttAt > 10000000)
             {
-                _clockOffset = phoneNow - (sent + rtt / 2);
-                _clockValid = true;
-                _bestRtt = rtt;
-                _bestRttAt = now;
+                self.clockOffset = phoneNow - (sent + rtt / 2);
+                self.clockValid = true;
+                self.bestRtt = rtt;
+                self.bestRttAt = now;
             }
-            std::lock_guard<std::mutex> lk(_statsLock);
-            _stats.rttMs = sorted[sorted.size() / 2];
-            _stats.clockOffsetMs = _clockOffset / 1000.0;
+            std::lock_guard<std::mutex> lk(_lock);
+            self.stats.rttMs = sorted[sorted.size() / 2];
+            self.stats.clockOffsetMs = self.clockOffset / 1000.0;
             break;
         }
         case proto::kOrient:
         {
             if (len < 2)
                 break;
-            _rotation = Be16(p);
-            std::lock_guard<std::mutex> lk(_statsLock);
-            _stats.rotation = _rotation;
+            self.rotation = Be16(p);
+            std::lock_guard<std::mutex> lk(_lock);
+            self.stats.rotation = self.rotation;
             break;
         }
         case proto::kInfo:
-            ParseInfo(p, len);
+        {
+            PhoneInfo info = ParseInfo(p, len);
+            std::lock_guard<std::mutex> lk(_lock);
+            self.phone = info;
+            _serial++;
             break;
+        }
         }
 
         int64_t now = NowUs();
         if (now - statsAt >= 1000000)
         {
             double secs = (now - statsAt) / 1e6;
-            std::lock_guard<std::mutex> lk(_statsLock);
-            _stats.inFps = _frameCounter / secs;
-            _stats.inMbps = _byteCounter * 8 / secs / 1e6;
-            _stats.decodeMs = _decodeCount ? _decodeAccum / _decodeCount : 0;
-            _stats.latencyMs = _latencyAvg;
-            _frameCounter = 0;
-            _byteCounter = 0;
-            _decodeAccum = 0;
-            _decodeCount = 0;
+            std::lock_guard<std::mutex> lk(_lock);
+            self.stats.inFps = self.frames / secs;
+            self.stats.inMbps = self.bytes * 8 / secs / 1e6;
+            self.stats.decodeMs = self.decodeCount ? self.decodeAccum / self.decodeCount : 0;
+            self.stats.latencyMs = self.latencyAvg;
+            self.frames = 0;
+            self.bytes = 0;
+            self.decodeAccum = 0;
+            self.decodeCount = 0;
             statsAt = now;
         }
     }
@@ -494,41 +613,52 @@ void Server::ClientLoop(SOCKET s, std::wstring address)
     alive = false;
     shutdown(s, SD_BOTH);
     pinger.join();
-    SOCKET expected = s;
-    _client.compare_exchange_strong(expected, INVALID_SOCKET);
     closesocket(s);
     {
-        std::lock_guard<std::mutex> lk(_statsLock);
-        _stats.connected = false;
-        _stats.inFps = _stats.inMbps = 0;
-        _stats.latencyMs = _stats.rttMs = -1;
-        _phone = PhoneInfo{};
-        _phoneSerial++;
+        std::lock_guard<std::mutex> lk(_lock);
+        _sessions.erase(std::remove(_sessions.begin(), _sessions.end(), session), _sessions.end());
+        _serial++;
     }
+    self.done = true;
     CoUninitialize();
 }
 
-void Server::OnFrame(const uint8_t* y, int yPitch, const uint8_t* uv, int uvPitch, int w, int h, int64_t ptsUs,
-                     bool fullRange)
+void Server::OnFrame(Session& s, const uint8_t* y, int yPitch, const uint8_t* uv, int uvPitch, int w, int h,
+                     int64_t ptsUs, bool fullRange)
 {
-    bool rotate = (_rotation == 180) != _flip;
+    bool rotate = (s.rotation == 180) != _flip;
     bool flipV = rotate;
     bool flipH = rotate != _mirror;
+
+    bool mine[pcam::kMaxCameras];
+    bool preview;
     {
-        std::lock_guard<std::mutex> lk(g_writerLock);
-        _writer.Publish(y, yPitch, uv, uvPitch, w, h, _fps, flipH, flipV, fullRange);
+        std::lock_guard<std::mutex> lk(_lock);
+        for (int c = 0; c < pcam::kMaxCameras; c++)
+            mine[c] = Resolve(c).get() == &s;
+        preview = _previewPhone.empty() ? !_sessions.empty() && _sessions.front().get() == &s : s.name == _previewPhone;
+    }
+    for (int c = 0; c < pcam::kMaxCameras; c++)
+    {
+        if (!mine[c])
+            continue;
+        std::lock_guard<std::mutex> lk(_writerLocks[c]);
+        int cw, ch;
+        // Only cameras an app is reading get frames, so idle cameras cost no copying.
+        if (_writers[c].ClientActive(cw, ch))
+            _writers[c].Publish(y, yPitch, uv, uvPitch, w, h, s.fps, flipH, flipV, fullRange);
     }
 
     int64_t now = NowUs();
-    if (_clockValid)
+    if (s.clockValid)
     {
-        double latency = (now - (ptsUs - _clockOffset)) / 1000.0;
+        double latency = (now - (ptsUs - s.clockOffset)) / 1000.0;
         if (latency > -20 && latency < 5000)
-            _latencyAvg = _latencyAvg < 0 ? latency : _latencyAvg * 0.9 + latency * 0.1;
+            s.latencyAvg = s.latencyAvg < 0 ? latency : s.latencyAvg * 0.9 + latency * 0.1;
     }
-    if (_previewOn && now - _lastPreviewUs >= 66000)
+    if (preview && _previewOn && now - s.lastPreviewUs >= 66000)
     {
-        _lastPreviewUs = now;
+        s.lastPreviewUs = now;
         UpdatePreview(y, yPitch, uv, uvPitch, w, h, flipH, flipV, fullRange);
     }
 }
@@ -630,16 +760,19 @@ void Server::BeaconLoop()
             sendto(u, message.data(), (int)message.size(), 0, (sockaddr*)&to, sizeof(to));
         }
         {
-            std::lock_guard<std::mutex> lk(_statsLock);
+            std::lock_guard<std::mutex> lk(_lock);
             _addresses = addresses;
         }
         for (int i = 0; i < 10 && _running; i++)
         {
             if (i % 5 == 0)
             {
-                bool connected = GetStats().connected;
-                std::lock_guard<std::mutex> lk(g_writerLock);
-                _writer.Heartbeat(connected, _english);
+                for (int c = 0; c < pcam::kMaxCameras; c++)
+                {
+                    bool connected = !CameraSource(c).empty();
+                    std::lock_guard<std::mutex> lk(_writerLocks[c]);
+                    _writers[c].Heartbeat(connected, _english);
+                }
             }
             Sleep(100);
         }
@@ -647,29 +780,60 @@ void Server::BeaconLoop()
     closesocket(u);
 }
 
-// USB mode: "adb reverse" lets the phone reach the PC through 127.0.0.1:47801.
+// Runs a hidden command and returns its standard output.
+static std::string RunCapture(std::wstring cmd, DWORD timeoutMs)
+{
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+    HANDLE readPipe, writePipe;
+    if (!CreatePipe(&readPipe, &writePipe, &sa, 0))
+        return "";
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si{ sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = writePipe;
+    si.hStdError = writePipe;
+    PROCESS_INFORMATION pi{};
+    std::string out;
+    if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        CloseHandle(writePipe);
+        writePipe = nullptr;
+        char buf[4096];
+        DWORD n;
+        while (ReadFile(readPipe, buf, sizeof(buf), &n, nullptr) && n)
+            out.append(buf, n);
+        if (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_TIMEOUT)
+            TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    if (writePipe)
+        CloseHandle(writePipe);
+    CloseHandle(readPipe);
+    return out;
+}
+
+// USB mode: "adb reverse" lets every plugged-in phone reach the PC through 127.0.0.1:47801.
 void Server::AdbLoop()
 {
     std::wstring adb = ExtractAdb(); // embedded in the exe
     if (adb.empty())
         return;
+    std::wstring port = std::to_wstring(proto::kStreamPort);
 
     while (_running)
     {
         if (_usbOn)
         {
-            std::wstring cmd = L"\"" + adb + L"\" reverse tcp:" + std::to_wstring(proto::kStreamPort) + L" tcp:" +
-                               std::to_wstring(proto::kStreamPort);
-            STARTUPINFOW si{ sizeof(si) };
-            si.dwFlags = STARTF_USESHOWWINDOW;
-            si.wShowWindow = SW_HIDE;
-            PROCESS_INFORMATION pi{};
-            if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+            // "adb devices": one "<serial>\tdevice" line per authorized phone.
+            for (const std::string& line : Split(RunCapture(L"\"" + adb + L"\" devices", 8000), '\n'))
             {
-                if (WaitForSingleObject(pi.hProcess, 8000) == WAIT_TIMEOUT)
-                    TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+                size_t tab = line.find('\t');
+                if (tab == std::string::npos || line.compare(tab + 1, 6, "device") != 0)
+                    continue;
+                std::wstring serial = FromUtf8(line.data(), (int)tab);
+                RunCapture(L"\"" + adb + L"\" -s " + serial + L" reverse tcp:" + port + L" tcp:" + port, 8000);
             }
         }
         for (int i = 0; i < 30 && _running; i++)

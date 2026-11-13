@@ -185,20 +185,18 @@ private:
     ComPtr<MediaSource> _source;
 };
 
-class __declspec(uuid("7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B17")) Activator1 : public ActivatorBase
-{
-public:
-    Activator1() : ActivatorBase(0) {}
-};
-
-class __declspec(uuid("7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B18")) Activator2 : public ActivatorBase
-{
-public:
-    Activator2() : ActivatorBase(1) {}
-};
-
-class __declspec(uuid("7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B19")) Activator3 : public ActivatorBase
-{
-public:
-    Activator3() : ActivatorBase(2) {}
-};
+// One COM class per camera (pcam::kCameraClsids), all serving the same source.
+#define PHONECAM_ACTIVATOR(n, guid)                                                                                    \
+    class __declspec(uuid(guid)) Activator##n : public ActivatorBase                                                    \
+    {                                                                                                                  \
+    public:                                                                                                            \
+        Activator##n() : ActivatorBase(n - 1) {}                                                                       \
+    };
+PHONECAM_ACTIVATOR(1, "7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B17")
+PHONECAM_ACTIVATOR(2, "7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B18")
+PHONECAM_ACTIVATOR(3, "7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B19")
+PHONECAM_ACTIVATOR(4, "7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B1A")
+PHONECAM_ACTIVATOR(5, "7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B1B")
+PHONECAM_ACTIVATOR(6, "7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B1C")
+PHONECAM_ACTIVATOR(7, "7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B1D")
+PHONECAM_ACTIVATOR(8, "7B1E3C52-9A4D-4F6B-8E21-5C3D9F0A6B1E")

@@ -20,3 +20,8 @@ enum
     kResAdbWinApi = 103,
     kResAdbWinUsbApi = 104,
 };
+
+// Installed virtual cameras (HKLM, set by the setup; default pcam::kDefaultCameras).
+int InstalledCameraCount();
+// Elevated: installs the first `count` cameras and removes the rest ("--cameras N").
+int DoSetCameraCount(int count);

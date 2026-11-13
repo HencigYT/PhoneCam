@@ -25,7 +25,7 @@ bool FrameReader::EnsureOpen()
 
     if (!_event)
         _event = OpenOrCreateEvent(_camera);
-    _map = OpenOrCreateMapping();
+    _map = OpenOrCreateMapping(_camera);
     if (!_map)
         return false;
     _view = MapViewOfFile(_map, FILE_MAP_ALL_ACCESS, 0, 0, kTotalBytes);
@@ -206,7 +206,7 @@ void FrameReader::RenderNV12(uint8_t* dst, LONG pitch, uint32_t width, uint32_t 
     if (EnsureOpen())
     {
         Header* hd = Hdr();
-        ReaderInfo& me = hd->readers[_camera];
+        ReaderInfo& me = hd->reader;
         me.width = (LONG)width;
         me.height = (LONG)height;
         InterlockedExchange64(&me.tick, (LONG64)GetTickCount64());

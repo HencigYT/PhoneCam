@@ -8,6 +8,7 @@
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
+#include <algorithm>
 #include <cmath>
 #include <string>
 
@@ -16,13 +17,15 @@ using namespace Gdiplus;
 static Server g_server;
 static HINSTANCE g_inst;
 static HWND g_main, g_preview;
-static HWND g_cbCamera, g_cbResolution, g_cbFps, g_cbCodec, g_cbBitrate;
+static HWND g_cbPhone, g_cbCamera, g_cbResolution, g_cbFps, g_cbCodec, g_cbBitrate;
+static HWND g_cbSource[pcam::kMaxCameras];
 static HWND g_tgStab, g_tgTorch, g_slZoom;
 static HWND g_tgMirror, g_tgFlip, g_tgPreview, g_tgUsb;
 static HFONT g_comboFont;
 static HBRUSH g_cardBrush;
 static int g_dpi = 96;
 static int g_camerasFound = -1;
+static int g_cameraCount = pcam::kDefaultCameras;
 bool lang::g_english = false;
 
 // HU | EN switch in the header.
@@ -32,6 +35,10 @@ static std::vector<uint32_t> g_pixels;
 static int g_pixW = 0, g_pixH = 0;
 static uint64_t g_pixSerial = 0;
 
+// The phone shown in the phone card, settings, stats and preview.
+static std::wstring g_selected;
+static std::vector<std::wstring> g_phones;
+static std::wstring g_cameraPhone[pcam::kMaxCameras]; // "" = first phone
 static PhoneInfo g_phone;
 static uint64_t g_phoneSerial = ~0ull;
 static bool g_populating = false;
@@ -54,6 +61,8 @@ enum
     IdFlip,
     IdPreview,
     IdUsb,
+    IdPhone,
+    IdSource0, // .. IdSource0 + kMaxCameras - 1
     TimerStatus = 1,
     TimerPreview = 2,
 };
@@ -61,17 +70,20 @@ enum
 // Layout in 96-dpi units.
 static const RECT kPreviewCard{ 24, 64, 704, 464 };
 static const RECT kTiles{ 24, 476, 704, 552 };
-static const RECT kInfoCard{ 24, 564, 704, 688 };
+static const RECT kInfoCard{ 24, 564, 704, 764 };
 static const RECT kPhoneCard{ 720, 64, 1064, 168 };
 static const RECT kSettingsCard{ 720, 180, 1064, 448 };
 static const RECT kControlCard{ 720, 460, 1064, 572 };
-static const RECT kPcCard{ 720, 584, 1064, 688 };
-static const int kClientW = 1088, kClientH = 712;
+static const RECT kPcCard{ 720, 584, 1064, 764 };
+static const int kClientW = 1088, kClientH = 788;
+// Camera rows: two columns of four.
+static const int kCamRowTop = 44, kCamRowHeight = 32, kCamColWidth = 324;
 
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
 static float F(float v) { return v * g_dpi / 96.0f; }
 static RectF R(const RECT& r) { return RectF(F((float)r.left), F((float)r.top), F((float)(r.right - r.left)), F((float)(r.bottom - r.top))); }
 static RectF R(float x, float y, float w, float h) { return RectF(F(x), F(y), F(w), F(h)); }
+static RECT Scaled(int l, int t, int r, int b) { return RECT{ S(l), S(t), S(r), S(b) }; }
 
 static const wchar_t kSettingsKey[] = L"Software\\PhoneCam";
 
@@ -85,6 +97,21 @@ static DWORD LoadSetting(const wchar_t* name, DWORD def)
 static void SaveSetting(const wchar_t* name, DWORD v)
 {
     RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, name, REG_DWORD, &v, sizeof(v));
+}
+
+static std::wstring LoadText(const std::wstring& name)
+{
+    wchar_t buf[256];
+    DWORD size = sizeof(buf);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, name.c_str(), RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS)
+        return L"";
+    return buf;
+}
+
+static void SaveText(const std::wstring& name, const std::wstring& value)
+{
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, name.c_str(), REG_SZ, value.c_str(),
+                    (DWORD)((value.size() + 1) * sizeof(wchar_t)));
 }
 
 static std::wstring Fmt(const wchar_t* fmt, ...)
@@ -170,7 +197,7 @@ static std::wstring ResolutionName(int w, int h)
     return tag + L"  (" + std::to_wstring(w) + L"×" + std::to_wstring(h) + L")";
 }
 
-// Fills the phone controls from the latest report of the phone.
+// Fills the phone controls from the latest report of the selected phone.
 static void PopulateFromPhone()
 {
     g_populating = true;
@@ -196,8 +223,10 @@ static void PopulateFromPhone()
                 ComboAdd(g_cbFps, std::to_wstring(f) + L" fps", f, f == g_phone.fps);
         }
         bool hevc = (g_server.Codecs() & 2) != 0;
-        ComboAdd(g_cbCodec, lang::tr(L"H.264 – mindenhol megy", L"H.264 – works everywhere"), 0, g_phone.codec == 0);
-        ComboAdd(g_cbCodec, hevc ? lang::tr(L"H.265 (HEVC) – jobb kép", L"H.265 (HEVC) – better image") : lang::tr(L"H.265 – nincs dekóder a PC-n", L"H.265 – no decoder on this PC"), 1, g_phone.codec == 1);
+        ComboAdd(g_cbCodec, lang::tr(L"H.264 (mindenhol megy)", L"H.264 (works everywhere)"), 0, g_phone.codec == 0);
+        ComboAdd(g_cbCodec, hevc ? lang::tr(L"H.265 (jobb kép)", L"H.265 (better image)")
+                                 : lang::tr(L"H.265 (nincs dekóder a PC-n)", L"H.265 (no decoder on this PC)"),
+                 1, g_phone.codec == 1);
         for (int b : kBitrates)
             ComboAdd(g_cbBitrate, b == 0 ? std::wstring(lang::tr(L"Automatikus", L"Automatic")) : std::to_wstring(b) + L" Mbit/s", b, b == g_phone.bitrate);
         ui::SetToggle(g_tgStab, g_phone.stabilization);
@@ -211,9 +240,37 @@ static void PopulateFromPhone()
     g_populating = false;
 }
 
+// The phone picker and the per-camera source pickers follow the connected phones.
+static void PopulatePhoneLists()
+{
+    g_populating = true;
+    ComboReset(g_cbPhone);
+    for (size_t i = 0; i < g_phones.size(); i++)
+        ComboAdd(g_cbPhone, g_phones[i], (LPARAM)i, g_phones[i] == g_selected);
+    ShowWindow(g_cbPhone, g_phones.empty() ? SW_HIDE : SW_SHOW);
+
+    for (int c = 0; c < pcam::kMaxCameras; c++)
+    {
+        HWND cb = g_cbSource[c];
+        ComboReset(cb);
+        // Item data: -1 = first phone, -2 = the remembered phone that is not connected, else index into g_phones.
+        ComboAdd(cb, lang::tr(L"Első telefon", L"First phone"), -1, g_cameraPhone[c].empty());
+        bool listed = g_cameraPhone[c].empty();
+        for (size_t i = 0; i < g_phones.size(); i++)
+        {
+            ComboAdd(cb, g_phones[i], (LPARAM)i, g_phones[i] == g_cameraPhone[c]);
+            listed |= g_phones[i] == g_cameraPhone[c];
+        }
+        if (!listed)
+            ComboAdd(cb, g_cameraPhone[c] + lang::tr(L" (nincs bent)", L" (offline)"), -2, true);
+        ShowWindow(cb, c < g_cameraCount ? SW_SHOW : SW_HIDE);
+    }
+    g_populating = false;
+}
+
 static void SendToPhone(const std::string& settings)
 {
-    g_server.SendSettings(settings);
+    g_server.SendSettings(g_selected, settings);
 }
 
 static void OnPhoneControl(int id)
@@ -254,6 +311,28 @@ static void OnPhoneControl(int id)
     }
 }
 
+static void SelectPhone(const std::wstring& name)
+{
+    g_selected = name;
+    g_server.SetPreviewPhone(name);
+    g_phone = g_server.GetPhoneInfo(name);
+    g_pixels.clear();
+    InvalidateRect(g_preview, nullptr, FALSE);
+    PopulateFromPhone();
+}
+
+static void OnSourceChanged(int camera)
+{
+    if (g_populating)
+        return;
+    LPARAM d = ComboData(g_cbSource[camera]);
+    if (d == -2)
+        return; // the remembered, disconnected phone: nothing changes
+    g_cameraPhone[camera] = d == -1 || d >= (LPARAM)g_phones.size() ? L"" : g_phones[d];
+    g_server.SetCameraPhone(camera, g_cameraPhone[camera]);
+    SaveText(L"CameraPhone" + std::to_wstring(camera), g_cameraPhone[camera]);
+}
+
 static void SendZoom(bool force)
 {
     ULONGLONG now = GetTickCount64();
@@ -267,7 +346,21 @@ static void SendZoom(bool force)
 
 // ------------------------------------------------------------------ painting
 
-static void DrawCardTitle(Graphics& g, const RECT& card, const wchar_t* title)
+static RECT CameraCell(int camera)
+{
+    int col = camera / 4, row = camera % 4;
+    int x = kInfoCard.left + 16 + col * kCamColWidth, y = kInfoCard.top + kCamRowTop + row * kCamRowHeight;
+    return RECT{ x, y, x + kCamColWidth - 16, y + kCamRowHeight };
+}
+
+// "−" and "+" buttons in the camera card header.
+static RECT CameraButton(bool plus)
+{
+    int right = kInfoCard.right - 16 - (plus ? 0 : 34);
+    return RECT{ right - 28, kInfoCard.top + 9, right, kInfoCard.top + 35 };
+}
+
+static void DrawCardTitle(Graphics& g, const RECT& card, const std::wstring& title)
 {
     ui::Text(g, title, R(card.left + 16.0f, card.top + 10.0f, 300, 24), 15, ui::kText, true);
 }
@@ -285,7 +378,7 @@ static void DrawBattery(Graphics& g, float x, float y, int percent, bool chargin
         SolidBrush fill{ Color(color) };
         g.FillRectangle(&fill, R(x + 3, y + 3, 28.0f * std::min(percent, 100) / 100, 11));
     }
-    std::wstring text = percent < 0 ? L"–" : std::to_wstring(percent) + L"%";
+    std::wstring text = percent < 0 ? L"?" : std::to_wstring(percent) + L"%";
     ui::Text(g, text, R(x + 44, y - 6, 80, 30), 20, ui::kText, true);
     if (charging)
         ui::Text(g, lang::tr(L"⚡ töltés", L"⚡ charging"), R(x + 44, y + 22, 100, 18), 12, ui::kYellow);
@@ -312,15 +405,18 @@ static void Paint(HDC dc)
         g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
         g.Clear(Color(ui::kBg));
 
-        Stats st = g_server.GetStats();
+        Stats st = g_server.GetStats(g_selected);
+        const wchar_t* none = L"-";
 
         // Header
         ui::Text(g, L"PhoneCam", R(24, 14, 200, 36), 24, ui::kText, true);
         ui::Text(g, lang::tr(L"a telefonod mint webkamera", L"your phone as a webcam"), R(168, 20, 300, 30), 13, ui::kMuted);
-        std::wstring pill = st.connected ? std::wstring(lang::tr(L"Csatlakozva · ", L"Connected · ")) + st.phoneName : std::wstring(lang::tr(L"Várakozás a telefonra", L"Waiting for the phone"));
+        std::wstring pill = g_phones.empty() ? std::wstring(lang::tr(L"Várakozás a telefonra", L"Waiting for the phone"))
+                            : g_phones.size() == 1 ? std::wstring(lang::tr(L"Csatlakozva: ", L"Connected: ")) + g_phones[0]
+                                                   : Fmt(lang::tr(L"%d telefon csatlakozva", L"%d phones connected"), (int)g_phones.size());
         RectF pillRect = R(724, 18, 340, 30);
         ui::FillRound(g, pillRect, F(15), ui::kCard, ui::kBorder);
-        SolidBrush dot{ Color(st.connected ? ui::kGreen : ui::kYellow) };
+        SolidBrush dot{ Color(g_phones.empty() ? ui::kYellow : ui::kGreen) };
         g.FillEllipse(&dot, pillRect.X + F(14), pillRect.Y + F(11), F(8), F(8));
         ui::Text(g, pill, RectF(pillRect.X + F(30), pillRect.Y, pillRect.Width - F(40), pillRect.Height), 13, ui::kText);
 
@@ -338,61 +434,63 @@ static void Paint(HDC dc)
         for (const RECT* card : { &kPreviewCard, &kInfoCard, &kPhoneCard, &kSettingsCard, &kControlCard, &kPcCard })
             ui::FillRound(g, R(*card), F(14), ui::kCard, ui::kBorder);
 
-        // Stat tiles
+        // Stat tiles (selected phone)
         float tw = (kTiles.right - kTiles.left - 4 * 10) / 5.0f;
         float tx = (float)kTiles.left, ty = (float)kTiles.top;
         bool live = st.connected && st.width;
-        DrawTile(g, tx, ty, tw, lang::tr(L"Képkocka/mp", L"Frame rate"), live ? Fmt(L"%.0f / %d", st.inFps, st.fps) : L"–");
-        DrawTile(g, tx + (tw + 10), ty, tw, lang::tr(L"Bitráta", L"Bitrate"), live ? Fmt(L"%.1f Mbit/s", st.inMbps) : L"–");
+        DrawTile(g, tx, ty, tw, lang::tr(L"Képkocka/mp", L"Frame rate"), live ? Fmt(L"%.0f / %d", st.inFps, st.fps) : none);
+        DrawTile(g, tx + (tw + 10), ty, tw, lang::tr(L"Bitráta", L"Bitrate"), live ? Fmt(L"%.1f Mbit/s", st.inMbps) : none);
         DrawTile(g, tx + 2 * (tw + 10), ty, tw, lang::tr(L"Késés", L"Latency"),
-                 live && st.latencyMs >= 0 ? Fmt(L"~%.0f ms", st.latencyMs) : L"–",
+                 live && st.latencyMs >= 0 ? Fmt(L"~%.0f ms", st.latencyMs) : none,
                  st.latencyMs > 150 ? ui::kYellow : ui::kText);
-        DrawTile(g, tx + 3 * (tw + 10), ty, tw, lang::tr(L"Hálózat (RTT)", L"Network (RTT)"), st.connected && st.rttMs >= 0 ? Fmt(L"%.0f ms", st.rttMs) : L"–");
+        DrawTile(g, tx + 3 * (tw + 10), ty, tw, lang::tr(L"Hálózat (RTT)", L"Network (RTT)"), st.connected && st.rttMs >= 0 ? Fmt(L"%.0f ms", st.rttMs) : none);
         DrawTile(g, tx + 4 * (tw + 10), ty, tw, lang::tr(L"Dekódolás", L"Decoding"),
-                 live ? Fmt(L"%.1f ms %s", st.decodeMs, st.hardwareDecode ? L"GPU" : L"CPU") : L"–");
+                 live ? Fmt(L"%.1f ms %s", st.decodeMs, st.hardwareDecode ? L"GPU" : L"CPU") : none);
 
-        // Virtual cameras
+        // Virtual cameras: one row per installed camera with its source phone
         const RECT& ic = kInfoCard;
-        DrawCardTitle(g, ic, lang::tr(L"Virtuális kamerák", L"Virtual cameras"));
-        ui::Text(g, lang::tr(L"Egy kamerát egyszerre egy program használhat (pl. Discord: 1, OBS: 2)", L"One camera can be used by one program at a time (e.g. Discord: 1, OBS: 2)"),
-                 R(ic.left + 170.0f, ic.top + 10.0f, 500, 24), 12, ui::kMuted);
-        for (int i = 0; i < pcam::kCameraCount; i++)
+        DrawCardTitle(g, ic, Fmt(lang::tr(L"Virtuális kamerák (%d)", L"Virtual cameras (%d)"), g_cameraCount));
+        ui::Text(g, lang::tr(L"Egy kamerát egyszerre egy program használhat", L"A camera can be used by one program at a time"),
+                 R(ic.left + 200.0f, ic.top + 10.0f, 380, 24), 12, ui::kMuted);
+        for (bool plus : { false, true })
         {
-            float y = ic.top + 36.0f + i * 20;
+            RECT b = CameraButton(plus);
+            bool enabled = plus ? g_cameraCount < pcam::kMaxCameras : g_cameraCount > 1;
+            ui::FillRound(g, R((float)b.left, (float)b.top, (float)(b.right - b.left), (float)(b.bottom - b.top)), F(8),
+                          ui::kTile, ui::kBorder);
+            ui::Text(g, plus ? L"+" : L"−", R((float)b.left, (float)b.top - 1, (float)(b.right - b.left), (float)(b.bottom - b.top)),
+                     16, enabled ? ui::kText : ui::kFaint, true, StringAlignmentCenter);
+        }
+        for (int i = 0; i < g_cameraCount; i++)
+        {
+            RECT cell = CameraCell(i);
             int cw = 0, ch = 0;
             bool used = g_server.ClientActive(i, cw, ch);
             SolidBrush d{ Color(used ? ui::kGreen : ui::kFaint) };
-            g.FillEllipse(&d, F(ic.left + 18.0f), F(y + 6), F(8), F(8));
-            ui::Text(g, pcam::kCameraNames[i], R(ic.left + 34.0f, y, 140, 20), 13, ui::kText, true);
-            ui::Text(g, used ? Fmt(lang::tr(L"használatban · %d×%d", L"in use · %d×%d"), cw, ch) : std::wstring(lang::tr(L"szabad", L"free")), R(ic.left + 150.0f, y, 300, 20), 13,
-                     used ? ui::kGreen : ui::kMuted);
+            g.FillEllipse(&d, F(cell.left + 2.0f), F(cell.top + 11.0f), F(8), F(8));
+            ui::Text(g, pcam::kCameraNames[i], R(cell.left + 16.0f, (float)cell.top, 100, 30), 13, ui::kText, true);
         }
         std::wstring footer;
         if (g_camerasFound == 0)
-            footer = lang::tr(L"A virtuális kamerák nincsenek telepítve – indítsd újra a PhoneCam-et, és engedélyezd a telepítést.", L"The virtual cameras are not installed – restart PhoneCam and allow the setup.");
+            footer = lang::tr(L"A virtuális kamerák nincsenek telepítve. Indítsd újra a PhoneCam-et, és engedélyezd a telepítést.",
+                              L"The virtual cameras are not installed. Restart PhoneCam and allow the setup.");
         else if (!st.error.empty())
             footer = st.error;
         else
-        {
-            std::wstring addrs;
-            for (auto& a : g_server.LocalAddresses())
-                addrs += (addrs.empty() ? L"" : L",  ") + a;
-            footer = std::wstring(lang::tr(L"PC címe (kézi megadáshoz):  ", L"PC address (for manual entry):  ")) + (addrs.empty() ? std::wstring(L"–") : addrs);
-        }
-        ui::Text(g, footer, R(ic.left + 16.0f, ic.top + 98.0f, 650, 20), 12,
-                 g_camerasFound == 0 || !st.error.empty() ? ui::kRed : ui::kMuted);
+            footer = lang::tr(L"Zöld pötty: épp használja egy program", L"Green dot: a program is using it");
+        ui::Text(g, footer, R(ic.left + 16.0f, ic.bottom - 28.0f, 650, 20), 12,
+                 g_camerasFound == 0 || !st.error.empty() ? ui::kRed : ui::kFaint);
 
-        // Phone
+        // Phone (the picker combo sits on top of the name line)
         const RECT& pc = kPhoneCard;
         if (st.connected)
         {
-            ui::Text(g, st.phoneName, R(pc.left + 16.0f, pc.top + 14.0f, 190, 26), 17, ui::kText, true);
             std::wstring link = st.usb ? std::wstring(lang::tr(L"USB kábel", L"USB cable")) : L"Wi-Fi · " + st.phoneAddress;
-            ui::Text(g, link, R(pc.left + 16.0f, pc.top + 42.0f, 190, 20), 13, ui::kMuted);
+            ui::Text(g, link, R(pc.left + 16.0f, pc.top + 46.0f, 190, 20), 13, ui::kMuted);
             if (st.width)
                 ui::Text(g, Fmt(L"%d×%d · %d fps · %s", st.width, st.height, st.fps, st.codec == CodecHEVC ? L"H.265" : L"H.264"),
-                         R(pc.left + 16.0f, pc.top + 66.0f, 200, 20), 13, ui::kMuted);
-            DrawBattery(g, pc.right - 124.0f, pc.top + 28.0f, g_phone.valid ? g_phone.battery : -1,
+                         R(pc.left + 16.0f, pc.top + 68.0f, 200, 20), 13, ui::kMuted);
+            DrawBattery(g, pc.right - 124.0f, pc.top + 46.0f, g_phone.valid ? g_phone.battery : -1,
                         g_phone.valid && g_phone.charging);
         }
         else
@@ -414,11 +512,16 @@ static void Paint(HDC dc)
         const RECT& cc = kControlCard;
         DrawCardTitle(g, cc, lang::tr(L"Vezérlés", L"Controls"));
         ui::Text(g, L"Zoom", R(cc.left + 16.0f, cc.top + 74.0f, 60, 28), 14, g_phone.valid ? ui::kText : ui::kFaint);
-        ui::Text(g, g_phone.valid ? Fmt(L"%.1f×", g_zoom) : L"–", R(cc.right - 70.0f, cc.top + 74.0f, 54, 28), 14,
+        ui::Text(g, g_phone.valid ? Fmt(L"%.1f×", g_zoom) : none, R(cc.right - 70.0f, cc.top + 74.0f, 54, 28), 14,
                  ui::kText, true, StringAlignmentFar);
 
-        // PC side image options
+        // PC side image options and the PC's addresses
         DrawCardTitle(g, kPcCard, lang::tr(L"Kép a gépen", L"Image on this PC"));
+        ui::Text(g, lang::tr(L"PC címe (kézi megadáshoz):", L"PC address (for manual entry):"),
+                 R(kPcCard.left + 16.0f, kPcCard.top + 108.0f, 310, 20), 12, ui::kMuted);
+        std::vector<std::wstring> addrs = g_server.LocalAddresses();
+        for (size_t i = 0; i < addrs.size() && i < 2; i++)
+            ui::Text(g, addrs[i], R(kPcCard.left + 16.0f, kPcCard.top + 128.0f + i * 18, 310, 18), 12, ui::kText);
     }
     BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, old);
@@ -437,9 +540,25 @@ static void ApplyLanguage()
     for (HWND t : { g_tgStab, g_tgTorch, g_tgMirror, g_tgFlip, g_tgPreview, g_tgUsb })
         InvalidateRect(t, nullptr, FALSE);
     PopulateFromPhone();
+    PopulatePhoneLists();
     g_server.SetEnglish(lang::g_english);
     InvalidateRect(g_main, nullptr, FALSE);
     InvalidateRect(g_preview, nullptr, FALSE);
+}
+
+// Adds or removes a virtual camera; Windows needs administrator approval for it.
+static void ChangeCameraCount(int delta)
+{
+    int count = g_cameraCount + delta;
+    if (count < 1 || count > pcam::kMaxCameras)
+        return;
+    unsigned long code = 1;
+    if (!RunElevated((L"--cameras " + std::to_wstring(count)).c_str(), code) || code != 0)
+        return;
+    g_cameraCount = InstalledCameraCount();
+    g_camerasFound = CountPhoneCams();
+    PopulatePhoneLists();
+    InvalidateRect(g_main, nullptr, FALSE);
 }
 
 static LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -508,15 +627,20 @@ static LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static HWND MakeCombo(HWND parent, int id, int row)
+static HWND MakeCombo(HWND parent, int id, int x, int y, int w)
 {
     HWND cb = CreateWindowExW(0, L"COMBOBOX", nullptr,
                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
-                              S(kSettingsCard.left + 130), S(kSettingsCard.top + 48 + row * 36),
-                              S(kSettingsCard.right - kSettingsCard.left - 146), S(320), parent,
-                              (HMENU)(INT_PTR)id, g_inst, nullptr);
+                              S(x), S(y), S(w), S(320), parent, (HMENU)(INT_PTR)id, g_inst, nullptr);
     SetWindowTheme(cb, L"DarkMode_CFD", nullptr);
     SendMessageW(cb, WM_SETFONT, (WPARAM)g_comboFont, TRUE);
+    return cb;
+}
+
+static HWND MakeSettingsCombo(HWND parent, int id, int row)
+{
+    HWND cb = MakeCombo(parent, id, kSettingsCard.left + 130, kSettingsCard.top + 48 + row * 36,
+                        kSettingsCard.right - kSettingsCard.left - 146);
     EnableWindow(cb, FALSE);
     return cb;
 }
@@ -536,25 +660,31 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_preview = CreateWindowExW(0, L"PhoneCamPreview", nullptr, WS_CHILD | WS_VISIBLE, S(kPreviewCard.left + 12),
                                     S(kPreviewCard.top + 12), S(656), S(376), hwnd, nullptr, g_inst, nullptr);
 
-        g_cbCamera = MakeCombo(hwnd, IdCamera, 0);
-        g_cbResolution = MakeCombo(hwnd, IdResolution, 1);
-        g_cbFps = MakeCombo(hwnd, IdFps, 2);
-        g_cbCodec = MakeCombo(hwnd, IdCodec, 3);
-        g_cbBitrate = MakeCombo(hwnd, IdBitrate, 4);
+        g_cbPhone = MakeCombo(hwnd, IdPhone, kPhoneCard.left + 16, kPhoneCard.top + 12, 200);
+        g_cbCamera = MakeSettingsCombo(hwnd, IdCamera, 0);
+        g_cbResolution = MakeSettingsCombo(hwnd, IdResolution, 1);
+        g_cbFps = MakeSettingsCombo(hwnd, IdFps, 2);
+        g_cbCodec = MakeSettingsCombo(hwnd, IdCodec, 3);
+        g_cbBitrate = MakeSettingsCombo(hwnd, IdBitrate, 4);
+        for (int c = 0; c < pcam::kMaxCameras; c++)
+        {
+            RECT cell = CameraCell(c);
+            g_cbSource[c] = MakeCombo(hwnd, IdSource0 + c, cell.left + 112, cell.top + 3, cell.right - cell.left - 112);
+            g_cameraPhone[c] = LoadText(L"CameraPhone" + std::to_wstring(c));
+            g_server.SetCameraPhone(c, g_cameraPhone[c]);
+        }
         const RECT& sc = kSettingsCard;
-        g_tgStab = ui::CreateToggle(hwnd, IdStab, L"Képstabilizálás (több késés)", S(sc.left + 16), S(sc.top + 228),
-                                    S(sc.right - sc.left - 32), S(28));
+        g_tgStab = ui::CreateToggle(hwnd, IdStab, L"", S(sc.left + 16), S(sc.top + 228), S(sc.right - sc.left - 32), S(28));
 
         const RECT& cc = kControlCard;
-        g_tgTorch = ui::CreateToggle(hwnd, IdTorch, L"Vaku (zseblámpa)", S(cc.left + 16), S(cc.top + 42),
-                                     S(cc.right - cc.left - 32), S(28));
+        g_tgTorch = ui::CreateToggle(hwnd, IdTorch, L"", S(cc.left + 16), S(cc.top + 42), S(cc.right - cc.left - 32), S(28));
         g_slZoom = ui::CreateSlider(hwnd, IdZoom, S(cc.left + 70), S(cc.top + 76), S(cc.right - cc.left - 150), S(24));
 
         const RECT& pc = kPcCard;
         int half = (pc.right - pc.left - 48) / 2;
-        g_tgMirror = ui::CreateToggle(hwnd, IdMirror, L"Tükrözés", S(pc.left + 16), S(pc.top + 40), S(half), S(26));
-        g_tgFlip = ui::CreateToggle(hwnd, IdFlip, L"Forgatás 180°", S(pc.left + 32 + half), S(pc.top + 40), S(half), S(26));
-        g_tgPreview = ui::CreateToggle(hwnd, IdPreview, L"Előnézet", S(pc.left + 16), S(pc.top + 70), S(half), S(26));
+        g_tgMirror = ui::CreateToggle(hwnd, IdMirror, L"", S(pc.left + 16), S(pc.top + 40), S(half), S(26));
+        g_tgFlip = ui::CreateToggle(hwnd, IdFlip, L"", S(pc.left + 32 + half), S(pc.top + 40), S(half), S(26));
+        g_tgPreview = ui::CreateToggle(hwnd, IdPreview, L"", S(pc.left + 16), S(pc.top + 70), S(half), S(26));
         g_tgUsb = ui::CreateToggle(hwnd, IdUsb, L"USB (adb)", S(pc.left + 32 + half), S(pc.top + 70), S(half), S(26));
         for (HWND t : { g_tgStab, g_tgTorch, g_slZoom })
             EnableWindow(t, FALSE);
@@ -588,7 +718,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN:
     {
         POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
-        RECT ls{ S(kLangSwitch.left), S(kLangSwitch.top), S(kLangSwitch.right), S(kLangSwitch.bottom) };
+        RECT ls = Scaled(kLangSwitch.left, kLangSwitch.top, kLangSwitch.right, kLangSwitch.bottom);
         if (PtInRect(&ls, pt))
         {
             bool english = pt.x >= (ls.left + ls.right) / 2;
@@ -598,6 +728,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SaveSetting(L"English", english);
                 ApplyLanguage();
             }
+            return 0;
+        }
+        for (bool plus : { false, true })
+        {
+            RECT b = CameraButton(plus);
+            RECT hit = Scaled(b.left, b.top, b.right, b.bottom);
+            if (PtInRect(&hit, pt))
+                ChangeCameraCount(plus ? 1 : -1);
         }
         return 0;
     }
@@ -615,7 +753,16 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int id = LOWORD(wp);
         if (HIWORD(wp) == CBN_SELCHANGE)
         {
-            OnPhoneControl(id);
+            if (id == IdPhone)
+            {
+                LPARAM i = ComboData(g_cbPhone);
+                if (!g_populating && i >= 0 && i < (LPARAM)g_phones.size())
+                    SelectPhone(g_phones[i]);
+            }
+            else if (id >= IdSource0 && id < IdSource0 + pcam::kMaxCameras)
+                OnSourceChanged(id - IdSource0);
+            else
+                OnPhoneControl(id);
             return 0;
         }
         if (HIWORD(wp) != BN_CLICKED)
@@ -663,15 +810,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == TimerStatus)
         {
-            uint64_t serial;
-            PhoneInfo info = g_server.GetPhoneInfo(serial);
+            uint64_t serial = g_server.PhonesSerial();
             if (serial != g_phoneSerial)
             {
                 g_phoneSerial = serial;
-                g_phone = info;
+                std::vector<std::wstring> phones = g_server.Phones();
+                if (phones != g_phones)
+                {
+                    g_phones = phones;
+                    bool stillThere = std::find(phones.begin(), phones.end(), g_selected) != phones.end();
+                    if (!stillThere)
+                        SelectPhone(phones.empty() ? L"" : phones[0]);
+                    PopulatePhoneLists(); // only when the list changes, so open dropdowns stay open
+                }
+                g_phone = g_server.GetPhoneInfo(g_selected);
                 PopulateFromPhone();
             }
-            if (!g_server.GetStats().connected && !g_pixels.empty())
+            if (g_phones.empty() && !g_pixels.empty())
             {
                 g_pixels.clear();
                 InvalidateRect(g_preview, nullptr, FALSE);
@@ -693,6 +848,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show)
 {
+    if (const wchar_t* p = wcsstr(cmdLine, L"--cameras "))
+        return DoSetCameraCount(_wtoi(p + 10));
     if (wcsstr(cmdLine, L"--install"))
         return DoInstall();
     if (wcsstr(cmdLine, L"--uninstall"))
@@ -731,6 +888,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show)
                                  L"Installing the virtual cameras needs administrator approval once.\nRestart PhoneCam and click Yes in the prompt."),
                         L"PhoneCam", MB_ICONWARNING);
     }
+    g_cameraCount = InstalledCameraCount();
     g_camerasFound = CountPhoneCams();
 
     std::wstring error;
@@ -761,9 +919,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show)
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     RECT rc{ 0, 0, S(kClientW), S(kClientH) };
     AdjustWindowRectEx(&rc, style, FALSE, 0);
-    CreateWindowExW(0, L"PhoneCamMain", L"PhoneCam", style, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left,
+    // --offscreen: UI test without showing anything or taking the focus.
+    bool offscreen = wcsstr(cmdLine, L"--offscreen") != nullptr;
+    CreateWindowExW(offscreen ? WS_EX_TOOLWINDOW : 0, L"PhoneCamMain", L"PhoneCam", style,
+                    offscreen ? -5000 : CW_USEDEFAULT, offscreen ? 0 : CW_USEDEFAULT, rc.right - rc.left,
                     rc.bottom - rc.top, nullptr, nullptr, inst, nullptr);
-    ShowWindow(g_main, show);
+    ShowWindow(g_main, offscreen ? SW_SHOWNOACTIVATE : show);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)

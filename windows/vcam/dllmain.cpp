@@ -7,6 +7,11 @@ using namespace Microsoft::WRL;
 CoCreatableClass(Activator1);
 CoCreatableClass(Activator2);
 CoCreatableClass(Activator3);
+CoCreatableClass(Activator4);
+CoCreatableClass(Activator5);
+CoCreatableClass(Activator6);
+CoCreatableClass(Activator7);
+CoCreatableClass(Activator8);
 
 static HMODULE g_module;
 
@@ -45,7 +50,7 @@ STDAPI DllRegisterServer()
     if (!GetModuleFileNameW(g_module, path, MAX_PATH))
         return HRESULT_FROM_WIN32(GetLastError());
     LSTATUS st = ERROR_SUCCESS;
-    for (int i = 0; i < pcam::kCameraCount && st == ERROR_SUCCESS; i++)
+    for (int i = 0; i < pcam::kMaxCameras && st == ERROR_SUCCESS; i++)
     {
         std::wstring key = ClsidKey(i);
         st = SetString(key, nullptr, pcam::kCameraNames[i]);
@@ -59,7 +64,7 @@ STDAPI DllRegisterServer()
 
 STDAPI DllUnregisterServer()
 {
-    for (int i = 0; i < pcam::kCameraCount; i++)
+    for (int i = 0; i < pcam::kMaxCameras; i++)
         RegDeleteTreeW(HKEY_LOCAL_MACHINE, ClsidKey(i).c_str());
     return S_OK;
 }

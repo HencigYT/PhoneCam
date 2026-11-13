@@ -13,6 +13,7 @@ bool lang::g_english = false;
 #include <stdio.h>
 #include <atomic>
 #include <thread>
+#include <algorithm>
 
 static int W = 1920, H = 1080, FPS = 60, SECONDS = 6;
 static std::mutex g_sendLock;
@@ -135,7 +136,7 @@ static std::vector<EncodedFrame> EncodeClip()
     return frames;
 }
 
-static void FakePhone(const std::vector<EncodedFrame>* clip)
+static void FakePhone(const std::vector<EncodedFrame>* clip, std::string name, size_t maxFrames)
 {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in a{};
@@ -146,12 +147,11 @@ static void FakePhone(const std::vector<EncodedFrame>* clip)
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
     if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) { printf("phone: connect failed\n"); return; }
 
-    const char name[] = "Fake S23";
-    std::vector<uint8_t> hello(8 + sizeof(name) - 1 + 1);
+    std::vector<uint8_t> hello(8 + name.size() + 1);
     PutBe32(&hello[0], proto::kMagic);
     hello[4] = 0; hello[5] = 1;
-    hello[6] = 0; hello[7] = (uint8_t)(sizeof(name) - 1);
-    memcpy(&hello[8], name, sizeof(name) - 1);
+    hello[6] = 0; hello[7] = (uint8_t)name.size();
+    memcpy(&hello[8], name.data(), name.size());
     hello.back() = 0;
     send(s, (const char*)hello.data(), (int)hello.size(), 0);
 
@@ -171,13 +171,9 @@ static void FakePhone(const std::vector<EncodedFrame>* clip)
             std::vector<uint8_t> p(len);
             if (len && recv(s, (char*)p.data(), (int)len, MSG_WAITALL) != (int)len) break;
             if (h[0] == proto::kSet)
-                printf("  phone got settings from PC: %.*s", (int)len, (const char*)p.data());
+                printf("  %s got settings from PC: %.*s", name.c_str(), (int)len, (const char*)p.data());
             if (h[0] == proto::kPing)
             {
-                static int n = 0;
-                int64_t sentAt = 0;
-                for (int i = 0; i < 8; i++) sentAt = sentAt << 8 | p[i];
-                if (n++ < 4) printf("  ping one-way PC->phone: %.2f ms\n", (NowUs() - sentAt) / 1000.0);
                 std::vector<uint8_t> pong(16);
                 memcpy(pong.data(), p.data(), 8);
                 PutBe64(&pong[8], NowUs());
@@ -211,7 +207,8 @@ cam=1|Előlapi #1|1920x1080|30
     SendPacket(s, proto::kInfo, std::vector<uint8_t>(info.begin(), info.end()));
 
     int64_t start = NowUs();
-    for (size_t i = 0; i < clip->size(); i++)
+    size_t count = std::min(maxFrames, clip->size());
+    for (size_t i = 0; i < count; i++)
     {
         int64_t due = start + (int64_t)i * 1000000 / FPS;
         while (NowUs() < due) Sleep(1);
@@ -222,7 +219,7 @@ cam=1|Előlapi #1|1920x1080|30
         memcpy(&frame[9], f.data.data(), f.data.size());
         SendPacket(s, proto::kFrame, frame);
     }
-    printf("phone: sent %zu frames in %.2fs\n", clip->size(), (NowUs() - start) / 1e6);
+    printf("%s: sent %zu frames in %.2fs\n", name.c_str(), count, (NowUs() - start) / 1e6);
     shutdown(s, SD_BOTH);
     reader.join();
     closesocket(s);
@@ -268,7 +265,7 @@ int wmain(int argc, wchar_t** argv)
         WSAStartup(MAKEWORD(2, 2), &wsa);
         std::vector<EncodedFrame> clip = EncodeClip();
         printf("encoded %zu frames\n", clip.size());
-        FakePhone(&clip);
+        FakePhone(&clip, "Fake S23", clip.size());
         return 0;
     }
 
@@ -285,139 +282,102 @@ int wmain(int argc, wchar_t** argv)
     if (PatchH264NoReorder(clip[0].data.data(), clip[0].data.size(), patched) &&
         _wfopen_s(&f, L"patched.h264", L"wb") == 0) { fwrite(patched.data(), 1, patched.size(), f); fclose(f); }
 
+    // Two phones: "Fake A" streams the whole clip and feeds camera 1 ("first phone"),
+    // "Fake B" streams 2 s and is chosen for camera 2.
     Server server;
     std::wstring err;
     if (!server.Start(err)) { wprintf(L"server: %s\n", err.c_str()); return 1; }
-    std::thread phone(FakePhone, &clip);
-    Sleep(1500);
+    server.SetCameraPhone(1, L"Fake B");
+    std::thread phoneA(FakePhone, &clip, std::string("Fake A"), clip.size());
+    Sleep(300);
+    std::thread phoneB(FakePhone, &clip, std::string("Fake B"), (size_t)FPS * 2);
+    Sleep(800);
+
+    std::vector<std::wstring> phones = server.Phones();
+    wprintf(L"phones: %zu", phones.size());
+    for (auto& p : phones) wprintf(L" [%s]", p.c_str());
+    wprintf(L"  camera1 source=%s camera2 source=%s\n", server.CameraSource(0).c_str(), server.CameraSource(1).c_str());
 
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring dll = exe;
     dll = dll.substr(0, dll.find_last_of(L'\\')) + L"\\..\\..\\dist\\PhoneCamVCam.dll";
     HMODULE m = LoadLibraryW(dll.c_str());
-    if (!m) { printf("LoadLibrary failed %lu\n", GetLastError()); phone.join(); return 1; }
+    if (!m) { printf("LoadLibrary failed %lu\n", GetLastError()); phoneA.join(); phoneB.join(); return 1; }
     auto getClass = (GetClassObjectFn)GetProcAddress(m, "DllGetClassObject");
-    ComPtr<IClassFactory> cf;
-    ComPtr<IMFActivate> act;
-    ComPtr<IMFMediaSource> src;
-    HRESULT hr = getClass(pcam::kCameraClsids[0], IID_PPV_ARGS(&cf));
-    if (SUCCEEDED(hr)) hr = cf->CreateInstance(nullptr, IID_PPV_ARGS(&act));
-    if (SUCCEEDED(hr)) hr = act->ActivateObject(IID_PPV_ARGS(&src));
-    ComPtr<IMFSourceReader> reader;
-    if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(src.Get(), nullptr, &reader);
-    printf("source + reader: hr=0x%08X\n", (unsigned)hr);
-    if (FAILED(hr)) { phone.join(); return 1; }
 
-    auto readSome = [&](int count, const char* label) {
+    auto open = [&](int camera, ComPtr<IMFMediaSource>& src, ComPtr<IMFSourceReader>& reader) {
+        ComPtr<IClassFactory> cf;
+        ComPtr<IMFActivate> act;
+        HRESULT hr = getClass(pcam::kCameraClsids[camera], IID_PPV_ARGS(&cf));
+        if (SUCCEEDED(hr)) hr = cf->CreateInstance(nullptr, IID_PPV_ARGS(&act));
+        if (SUCCEEDED(hr)) hr = act->ActivateObject(IID_PPV_ARGS(&src));
+        if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(src.Get(), nullptr, &reader);
+        printf("camera %d open: 0x%08X\n", camera + 1, (unsigned)hr);
+        return SUCCEEDED(hr);
+    };
+    // Reads for `seconds`; returns how many samples changed vs. the previous one (live video changes, a placeholder does not).
+    auto readFor = [&](ComPtr<IMFSourceReader>& reader, double seconds, int& samples) {
         ComPtr<IMFMediaType> cur;
         reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur);
-        UINT32 w, h, n, d;
+        UINT32 w, h;
         MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &w, &h);
-        MFGetAttributeRatio(cur.Get(), MF_MT_FRAME_RATE, &n, &d);
-        int64_t start = NowUs();
-        int fresh = 0, prevY = -1;
-        for (int i = 0; i < count; i++)
+        int64_t until = NowUs() + (int64_t)(seconds * 1e6);
+        int changed = 0, prevY = -1;
+        samples = 0;
+        while (NowUs() < until)
         {
             DWORD idx, flags;
             LONGLONG ts;
             ComPtr<IMFSample> s;
-            hr = reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &idx, &flags, &ts, &s);
-            if (FAILED(hr) || !s) { printf("  read failed hr=0x%08X flags=%lu\n", (unsigned)hr, flags); return; }
+            if (FAILED(reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &idx, &flags, &ts, &s)) || !s) break;
             ComPtr<IMFMediaBuffer> b;
             s->ConvertToContiguousBuffer(&b);
             BYTE* p; DWORD len;
             b->Lock(&p, nullptr, &len);
             int y = p[(h / 2) * w + w / 2];
             b->Unlock();
-            if (y != prevY) fresh++;
+            changed += y != prevY;
             prevY = y;
+            samples++;
         }
-        double secs = (NowUs() - start) / 1e6;
-        printf("%s: %ux%u@%u, %d samples in %.2fs (%.1f/s), %d changed\n", label, w, h, n / d, count, secs,
-               count / secs, fresh);
-    };
-    auto pick = [&](UINT32 want, bool yuy2) {
-        ComPtr<IMFMediaType> t;
-        for (DWORD i = 0; SUCCEEDED(reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &t)); i++)
-        {
-            UINT32 w, h;
-            GUID sub;
-            MFGetAttributeSize(t.Get(), MF_MT_FRAME_SIZE, &w, &h);
-            t->GetGUID(MF_MT_SUBTYPE, &sub);
-            if (w == want && (sub == MFVideoFormat_YUY2) == yuy2)
-                return SUCCEEDED(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, t.Get()));
-            t.Reset();
-        }
-        return false;
+        return changed;
     };
 
-    std::atomic<bool> polling{ true };
-    std::thread poller([&] { while (polling) { Stats st = server.GetStats(); if (st.connected) printf("  poll: in=%.1f decode=%.2f errors=%d err='%ls'\n", st.inFps, st.decodeMs, st.decodeErrors, st.error.c_str()); Sleep(1000); } });
-    readSome(FPS * 2, "default type");
-    {
-        uint64_t serial;
-        PhoneInfo pi = server.GetPhoneInfo(serial);
-        wprintf(L"  phone info: valid=%d battery=%d%%%s cameras=%zu [%s: %zu res, %zu fps] zoom %.2f..%.2f\n", pi.valid,
-                pi.battery, pi.charging ? L" (charging)" : L"", pi.cameras.size(),
-                pi.cameras.empty() ? L"-" : pi.cameras[0].label.c_str(),
-                pi.cameras.empty() ? 0 : pi.cameras[0].resolutions.size(), pi.cameras.empty() ? 0 : pi.cameras[0].fps.size(),
-                pi.zoomMin, pi.zoomMax);
-        printf("  send settings: %d\n", server.SendSettings("torch=1\nzoom=2.50\n"));
-    }
-    // Two cameras at once (e.g. Discord + OBS): both must get every frame.
-    {
-        ComPtr<IClassFactory> cf2;
-        ComPtr<IMFActivate> act2;
-        ComPtr<IMFMediaSource> src2;
-        ComPtr<IMFSourceReader> reader2;
-        HRESULT h2 = getClass(pcam::kCameraClsids[1], IID_PPV_ARGS(&cf2));
-        if (SUCCEEDED(h2)) h2 = cf2->CreateInstance(nullptr, IID_PPV_ARGS(&act2));
-        if (SUCCEEDED(h2)) h2 = act2->ActivateObject(IID_PPV_ARGS(&src2));
-        if (SUCCEEDED(h2)) h2 = MFCreateSourceReaderFromMediaSource(src2.Get(), nullptr, &reader2);
-        if (SUCCEEDED(h2))
-        {
-            std::atomic<int> n2{ 0 };
-            std::thread t2([&] {
-                for (int i = 0; i < FPS; i++)
-                {
-                    DWORD idx, flags; LONGLONG ts; ComPtr<IMFSample> s;
-                    if (FAILED(reader2->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &idx, &flags, &ts, &s))) break;
-                    if (s) n2++;
-                }
-            });
-            readSome(FPS, "camera 1 while camera 2 runs");
-            t2.join();
-            int c2w = 0, c2h = 0;
-            bool a1 = server.ClientActive(1, c2w, c2h);
-            printf("  camera 2 got %d frames, active=%d (%dx%d)\n", n2.load(), a1, c2w, c2h);
-            src2->Shutdown();
-        }
-        else
-            printf("  camera 2 open failed 0x%08X\n", (unsigned)h2);
-    }
-    auto stats = [&] {
-        Stats st = server.GetStats();
-        wprintf(L"  server: connected=%d %dx%d@%d in=%.1ffps %.2fMbps decode=%.2fms (%s) latency=%.1fms rtt=%.2fms offset=%.2fms errors=%d\n",
-                st.connected, st.width, st.height, st.fps, st.inFps, st.inMbps, st.decodeMs,
-                st.hardwareDecode ? L"GPU" : L"CPU", st.latencyMs, st.rttMs, st.clockOffsetMs, st.decodeErrors);
-    };
-    stats();
-    if (pick(1280, false))
-        readSome(FPS, "1280x720 NV12 (scaled)");
-    if (pick(1280, true))
-        readSome(FPS / 2, "1280x720 YUY2 (scaled)");
-    stats();
-    int cw = 0, ch = 0;
-    bool active = server.ClientActive(0, cw, ch);
-    printf("client active: %d (%dx%d)\n", active, cw, ch);
+    ComPtr<IMFMediaSource> src1, src2;
+    ComPtr<IMFSourceReader> reader1, reader2;
+    if (!open(0, src1, reader1) || !open(1, src2, reader2)) { phoneA.join(); phoneB.join(); return 1; }
 
-    polling = false;
-    poller.join();
-    phone.join();
-    src->Shutdown();
-    reader.Reset();
+    // While both phones stream, both cameras get live video.
+    int s1 = 0, s2 = 0, c1 = 0, c2 = 0;
+    std::thread t2([&] { c2 = readFor(reader2, 0.8, s2); });
+    c1 = readFor(reader1, 0.8, s1);
+    t2.join();
+    printf("both live:  camera1 %d samples / %d changed, camera2 %d samples / %d changed\n", s1, c1, s2, c2);
+
+    PhoneInfo infoA = server.GetPhoneInfo(L"Fake A");
+    Stats statsB = server.GetStats(L"Fake B");
+    wprintf(L"info A: valid=%d battery=%d cameras=%zu | stats B: connected=%d %dx%d@%d in=%.1f fps\n", infoA.valid,
+            infoA.battery, infoA.cameras.size(), statsB.connected, statsB.width, statsB.height, statsB.fps, statsB.inFps);
+    printf("send to B: %d\n", server.SendSettings(L"Fake B", "torch=1\n"));
+
+    // After B stops, camera 2 falls back to the placeholder while camera 1 stays live.
+    phoneB.join();
+    Sleep(1700);
+    std::thread t2b([&] { c2 = readFor(reader2, 0.8, s2); });
+    c1 = readFor(reader1, 0.8, s1);
+    t2b.join();
+    printf("B gone:     camera1 %d samples / %d changed, camera2 %d samples / %d changed, phones=%zu, camera2 source='%ls'\n",
+           s1, c1, s2, c2, server.Phones().size(), server.CameraSource(1).c_str());
+
+    bool ok = c1 > 10 && c2 <= 2 && server.Phones().size() == 1;
+    printf("%s\n", ok ? "PASS" : "FAIL");
+
+    phoneA.join();
+    src1->Shutdown();
+    src2->Shutdown();
+    reader1.Reset();
+    reader2.Reset();
     server.Stop();
-    printf("done\n");
-    return 0;
+    return ok ? 0 : 1;
 }

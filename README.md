@@ -55,7 +55,11 @@ USB-n. A PC-n három valódi Windows virtuális kamera jelenik meg (**PhoneCam**
 - A kamerák mindig léteznek (újraindítás után is), így az OBS indításkor is megtalálja őket.
   Ha a program nem fut vagy nincs telefon, a kamera ezt felirattal mutatja.
 - **Több program egyszerre:** a Windows egy kamerát egyszerre csak egy programnak ad, ezért
-  van három: pl. Discordban a „PhoneCam”, OBS-ben a „PhoneCam 2”.
+  van több: pl. Discordban a „PhoneCam”, OBS-ben a „PhoneCam 2”. A kamerák száma (1 és 8 között)
+  a PC ablakában a + és − gombbal állítható.
+- **Több telefon:** akárhány telefon csatlakozhat egyszerre, Wi-Fi-n és USB-n is. A PC ablakában
+  minden kamerához kiválasztható, melyik telefon képét adja (alapból az elsőét). A telefon
+  kártyáján választod ki, melyik telefon beállításait, vakuját és zoomját vezérled.
 - **USB mód** (legkisebb késés): telefonon Fejlesztői beállítások → USB hibakeresés be,
   kábel be, RSA kulcs elfogadása – a telefon magától USB-re vált.
 - **Nyelv:** a PC ablak fejlécében HU/EN kapcsoló, a telefonon Beállítások → Nyelv.
@@ -92,7 +96,11 @@ or USB. The PC gets three real Windows virtual cameras (**PhoneCam**, **PhoneCam
 - The cameras always exist (also after a reboot), so OBS finds them at startup. When the
   program is not running or no phone is connected, the camera shows a message.
 - **Several programs at once:** Windows gives a camera to one program at a time, that's why
-  there are three: e.g. "PhoneCam" in Discord, "PhoneCam 2" in OBS.
+  there are several: e.g. "PhoneCam" in Discord, "PhoneCam 2" in OBS. The number of cameras
+  (1 to 8) is set with the + and − buttons in the PC window.
+- **Several phones:** any number of phones can connect at once, over Wi-Fi and USB. In the PC
+  window each camera can be given its own phone (the first one by default); the phone picker on
+  the phone card selects which phone the settings, flash and zoom control.
 - **USB mode** (lowest delay): enable USB debugging in the phone's Developer options, plug in
   the cable and accept the RSA key – the phone switches to USB by itself.
 - **Language:** HU/EN switch in the header of the PC window; on the phone Settings → Language.

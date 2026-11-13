@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 #include <fstream>
 #include <iterator>
+#include <algorithm>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -14,7 +15,7 @@ using Microsoft::WRL::ComPtr;
 static const wchar_t kAppKey[] = L"SOFTWARE\\PhoneCam";
 static const wchar_t kDllName[] = L"PhoneCamVCam.dll";
 // Bumped whenever the set of registered cameras changes, so the setup reruns.
-static const DWORD kSetupVersion = 2;
+static const DWORD kSetupVersion = 3;
 
 static std::wstring ClsidKey(int camera)
 {
@@ -125,7 +126,7 @@ std::wstring ExtractAdb()
 bool InstallNeeded()
 {
     std::wstring installed = InstallDir() + L"\\" + kDllName;
-    for (int i = 0; i < pcam::kCameraCount; i++)
+    for (int i = 0; i < pcam::kMaxCameras; i++)
         if (_wcsicmp(ReadRegString(ServerKey(i), nullptr).c_str(), installed.c_str()) != 0)
             return true;
     if (ReadRegDword(kAppKey, L"SetupVersion") != kSetupVersion)
@@ -163,30 +164,48 @@ static std::wstring Netsh()
     return std::wstring(L"\"") + sys + L"\\netsh.exe\" advfirewall firewall ";
 }
 
+int InstalledCameraCount()
+{
+    DWORD n = ReadRegDword(kAppKey, L"CameraCount");
+    return n == 0 ? pcam::kDefaultCameras : (int)std::min<DWORD>(n, pcam::kMaxCameras);
+}
+
 // System-lifetime virtual cameras stay registered when PhoneCam.exe is closed and
 // across reboots, so apps like OBS always find them (they show a placeholder
 // until the program runs). Creating the same camera again returns the existing one.
-static HRESULT SetupCameras(bool remove)
+// The first `count` cameras are started, the rest removed.
+static void SetupCameras(int count)
 {
-    HRESULT result = S_OK;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION);
-    for (int i = 0; i < pcam::kCameraCount; i++)
+    for (int i = 0; i < pcam::kMaxCameras; i++)
     {
         ComPtr<IMFVirtualCamera> cam;
-        HRESULT hr = MFCreateVirtualCamera(MFVirtualCameraType_SoftwareCameraSource, MFVirtualCameraLifetime_System,
-                                           MFVirtualCameraAccess_AllUsers, pcam::kCameraNames[i],
-                                           pcam::kCameraClsidStrings[i], nullptr, 0, &cam);
-        if (SUCCEEDED(hr))
-            hr = remove ? cam->Remove() : cam->Start(nullptr);
-        if (cam)
+        // Errors are not fatal: Start() can fail for a camera that already exists and
+        // Remove() for one that never did; the window shows what Windows lists.
+        if (SUCCEEDED(MFCreateVirtualCamera(MFVirtualCameraType_SoftwareCameraSource, MFVirtualCameraLifetime_System,
+                                            MFVirtualCameraAccess_AllUsers, pcam::kCameraNames[i],
+                                            pcam::kCameraClsidStrings[i], nullptr, 0, &cam)))
+        {
+            if (i < count)
+                cam->Start(nullptr);
+            else
+                cam->Remove();
             cam->Shutdown();
-        if (FAILED(hr))
-            result = hr;
+        }
     }
     MFShutdown();
     CoUninitialize();
-    return result;
+}
+
+int DoSetCameraCount(int count)
+{
+    count = std::max(1, std::min(count, pcam::kMaxCameras));
+    DWORD n = (DWORD)count;
+    if (RegSetKeyValueW(HKEY_LOCAL_MACHINE, kAppKey, L"CameraCount", REG_DWORD, &n, sizeof(n)) != ERROR_SUCCESS)
+        return 5;
+    SetupCameras(count);
+    return 0;
 }
 
 int DoInstall()
@@ -198,24 +217,27 @@ int DoInstall()
     if (!EmbeddedFile(kResCameraDll, dll, dllSize))
         return 2;
     CreateDirectoryW(dir.c_str(), nullptr);
-    if (!FileEquals(dst, dll, dllSize) && !WriteFileBytes(dst, dll, dllSize))
+    if (!FileEquals(dst, dll, dllSize))
     {
-        // The frame server may still have the old DLL loaded: move it aside.
-        std::wstring old = dst + L"." + std::to_wstring(GetTickCount64()) + L".old";
-        if (MoveFileExW(dst.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING))
-            MoveFileExW(old.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
         if (!WriteFileBytes(dst, dll, dllSize))
-            return 2;
+        {
+            // The frame server may still have the old DLL loaded: move it aside.
+            std::wstring old = dst + L"." + std::to_wstring(GetTickCount64()) + L".old";
+            if (MoveFileExW(dst.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING))
+                MoveFileExW(old.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+            if (!WriteFileBytes(dst, dll, dllSize))
+                return 2;
+        }
+        // Drop the old DLL from the camera service; it starts again on the next camera use.
+        RunHidden(L"sc.exe stop FrameServer");
     }
-    for (int i = 0; i < pcam::kCameraCount; i++)
+    for (int i = 0; i < pcam::kMaxCameras; i++)
     {
         if (!SetRegString(ClsidKey(i), nullptr, pcam::kCameraNames[i]) || !SetRegString(ServerKey(i), nullptr, dst) ||
             !SetRegString(ServerKey(i), L"ThreadingModel", L"Both"))
             return 3;
     }
-    // Start() can report an error for cameras that already exist; the window
-    // shows whether Windows lists them, so this is not fatal.
-    SetupCameras(false);
+    SetupCameras(InstalledCameraCount());
 
     RunHidden(Netsh() + L"delete rule name=\"PhoneCam\"");
     RunHidden(Netsh() + L"add rule name=\"PhoneCam\" dir=in action=allow program=\"" + ExePath() +
@@ -228,8 +250,8 @@ int DoInstall()
 
 int DoUninstall()
 {
-    SetupCameras(true);
-    for (int i = 0; i < pcam::kCameraCount; i++)
+    SetupCameras(0);
+    for (int i = 0; i < pcam::kMaxCameras; i++)
         RegDeleteTreeW(HKEY_LOCAL_MACHINE, ClsidKey(i).c_str());
     RegDeleteTreeW(HKEY_LOCAL_MACHINE, kAppKey);
     RunHidden(Netsh() + L"delete rule name=\"PhoneCam\"");
